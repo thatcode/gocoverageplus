@@ -4,12 +4,12 @@ package source
 import (
 	"fmt"
 	"go/ast"
+	"go/token"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"go/token"
 	"golang.org/x/tools/go/packages"
 
 	"github.com/Fabianexe/gocoverageplus/pkg/entity"
@@ -49,61 +49,48 @@ func LoadSources(path string, excludePaths []string) (*entity.Project, error) {
 		for i, fileAst := range pkg.Syntax {
 			methodsMap := make(map[string][]*entity.Method)
 			for _, decl := range fileAst.Decls {
+				// Normal function Declaration found
 				if fun, ok := decl.(*ast.FuncDecl); ok {
-					method := &entity.Method{
-						Name: fun.Name.Name,
-						Body: fun.Body,
-						File: pkg.Fset.File(fun.Pos()),
-					}
-
-					// start after the function declaration
-					startLine := pkg.Fset.Position(fun.Body.Lbrace).Line + 1
-					endLine := pkg.Fset.Position(fun.End()).Line
-					if startLine >= endLine {
+					method := readFunc(fun.Name.Name, fun.Body, pkg)
+					if method == nil {
 						continue
 					}
-
-					bV := &branchVisitor{
-						fset: pkg.Fset,
-					}
-
-					ast.Walk(bV, fun)
-
-					method.Tree = bV.getTree()
 
 					countMethods++
 					className := getClassName(fun)
 					methodsMap[className] = append(methodsMap[className], method)
-				} else if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.VAR {
+
+					continue
+				}
+				// Normal var found. Could contain functions
+				if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.VAR {
 					for _, spec := range gen.Specs {
-						if valueSpec, ok := spec.(*ast.ValueSpec); ok {
-							for _, value := range valueSpec.Values {
-								if funcLit, ok := value.(*ast.FuncLit); ok && len(valueSpec.Names) > 0 {
-									method := &entity.Method{
-										Name: valueSpec.Names[0].Name,
-										Body: funcLit.Body,
-										File: pkg.Fset.File(value.Pos()),
-									}
+						valueSpec, ok := spec.(*ast.ValueSpec)
+						// only interested in ValueSpecs
+						if !ok {
+							continue
+						}
 
-									// start after the function declaration
-									startLine := pkg.Fset.Position(funcLit.Body.Lbrace).Line + 1
-									endLine := pkg.Fset.Position(funcLit.End()).Line
-									if startLine >= endLine {
-										continue
-									}
-
-									bV := &branchVisitor{
-										fset: pkg.Fset,
-									}
-
-									ast.Walk(bV, valueSpec)
-
-									method.Tree = bV.getTree()
-
-									countMethods++
-									methodsMap["-"] = append(methodsMap["-"], method)
-								}
+						// Check all value definitions
+						for pos, value := range valueSpec.Values {
+							// found a function that is called. We extract the function
+							if callExpr, ok := value.(*ast.CallExpr); ok {
+								value = callExpr.Fun
 							}
+
+							funcLit, ok := value.(*ast.FuncLit)
+							// only interested in inplace defined functions with a var name
+							if !ok || len(valueSpec.Names) < pos {
+								continue
+							}
+
+							method := readFunc(valueSpec.Names[pos].Name, funcLit.Body, pkg)
+							if method == nil {
+								continue
+							}
+
+							countMethods++
+							methodsMap["-"] = append(methodsMap["-"], method)
 						}
 					}
 				}
@@ -132,6 +119,32 @@ func LoadSources(path string, excludePaths []string) (*entity.Project, error) {
 	}
 	slog.Info("Source reading Finished", "Packages", countPackages, " Files", countFiles, " Methods", countMethods)
 	return &entity.Project{Packages: allPackages}, nil
+}
+
+// readFunc processes a function's body, constructing and returning a Method representation by using the given name and package.
+func readFunc(name string, body *ast.BlockStmt, pkg *packages.Package) *entity.Method {
+	method := &entity.Method{
+		Name: name,
+		Body: body,
+		File: pkg.Fset.File(body.Pos()),
+	}
+
+	// start after the function declaration
+	startLine := pkg.Fset.Position(body.Lbrace).Line + 1
+	endLine := pkg.Fset.Position(body.End()).Line
+	if startLine >= endLine {
+		return nil
+	}
+
+	bV := &branchVisitor{
+		fset: pkg.Fset,
+	}
+
+	ast.Walk(bV, body)
+
+	method.Tree = bV.getTree()
+
+	return method
 }
 
 func getGoPaths(path string, excludePaths []string) ([]string, error) {
